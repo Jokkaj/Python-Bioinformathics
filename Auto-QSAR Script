@@ -1,0 +1,248 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import matplotlib.pyplot as plt
+
+def clean_and_normalize_data(df):
+    """Cleans and normalizes the input DataFrame."""
+    df_cleaned = df.dropna()
+
+    for col in df_cleaned.select_dtypes(include=['object']).columns:
+        df_cleaned[col] = df_cleaned[col].astype(str).str.replace('"', '', regex=False)
+        try:
+            df_cleaned[col] = pd.to_numeric(df_cleaned[col])
+        except (ValueError, TypeError):
+            pass
+
+    df_no_name = df_cleaned.iloc[:, 1:]
+
+    if 'pAct' not in df_no_name.columns:
+        raise ValueError("The 'pAct' column was not found after cleaning.")
+    features_to_normalize = [col for col in df_no_name.columns if col != 'pAct']
+
+    df_normalized = df_no_name.copy()
+    for col in features_to_normalize:
+        min_val = df_normalized[col].min()
+        max_val = df_normalized[col].max()
+        if max_val - min_val != 0:
+            df_normalized[col] = (df_normalized[col] - min_val) / (max_val - min_val)
+        else:
+            df_normalized[col] = 0.0
+
+    df_normalized_rounded = df_normalized.round(2)
+    return df_normalized_rounded
+
+def perform_regression(X_data, Y_data):
+    X_with_intercept = np.column_stack([np.ones(X_data.shape[0]), X_data.values])
+    coefficients, residuals, rank, s = np.linalg.lstsq(X_with_intercept, Y_data.values, rcond=None)
+    ss_res = residuals[0] if residuals.size > 0 else np.sum((Y_data.values - (X_with_intercept @ coefficients))**2)
+    ss_tot = np.sum((Y_data.values - Y_data.values.mean())**2)
+    r_squared = 1 - (ss_res / ss_tot)
+    return coefficients, r_squared
+
+def main():
+    input_filename = "/drive/MyDrive/QSAR/data.csv"
+
+    df_original = pd.read_csv(input_filename)
+    print("Original DataFrame loaded:")
+    print(df_original.head())
+
+    df_normalized = clean_and_normalize_data(df_original)
+    print(f"\nData shape after cleaning and normalization: {df_normalized.shape}")
+    print("Normalized Data Head:")
+    print(df_normalized.head())
+
+    correlation_matrix_raw = df_normalized.corr(method='pearson')
+    correlation_matrix_squared = correlation_matrix_raw ** 2
+    correlation_matrix = correlation_matrix_squared.round(2)
+    print("\nCorrelation Matrix (values squared, then rounded to 2 decimals):")
+    print(correlation_matrix)
+
+    if 'pAct' not in correlation_matrix.columns:
+        raise ValueError("The 'pAct' column was not found in the correlation matrix.")
+
+    pAct_corr_series = correlation_matrix['pAct']
+    pAct_corr_without_self = pAct_corr_series[pAct_corr_series.index != 'pAct']
+    closest_feature_name = (pAct_corr_without_self - 1.0).abs().idxmin()
+    closest_corr_value = pAct_corr_without_self[closest_feature_name]
+
+    print(f"\nClosest correlation to 1.0 found in 'pAct' column: {closest_corr_value:.2f} for feature '{closest_feature_name}'")
+
+    if closest_feature_name not in df_normalized.columns:
+        raise ValueError(f"The feature '{closest_feature_name}' was not found in the normalized data.")
+
+    X_initial = df_normalized[[closest_feature_name]]
+    Y = df_normalized['pAct']
+
+    print(f"\nPerforming initial regression: Y ('pAct') vs X ('{closest_feature_name}')")
+
+    initial_coefficients, initial_r_squared = perform_regression(X_initial, Y)
+    initial_slope = initial_coefficients[1]
+    initial_intercept = initial_coefficients[0]
+
+    initial_slope_r = round(initial_slope, 2)
+    initial_intercept_r = round(initial_intercept, 2)
+    initial_r_squared_r = round(initial_r_squared, 2)
+
+    print("\n--- Initial Linear Regression Results (Rounded to 2 decimals) ---")
+    print(f"Feature used for X: [{closest_feature_name}]")
+    print(f"Slope for {closest_feature_name}: {initial_slope_r}")
+    print(f"Intercept: {initial_intercept_r}")
+    print(f"R-squared: {initial_r_squared_r}")
+    print("----------------------------------------------------------------\n")
+
+    current_r_squared = initial_r_squared
+    current_features = [closest_feature_name]
+    available_features = list(set(df_normalized.columns) - {'pAct'})
+    if closest_feature_name in available_features:
+        available_features.remove(closest_feature_name)
+
+    regression_iteration = 1
+    final_coefficients = initial_coefficients
+    final_r_squared = initial_r_squared_r
+
+    while available_features:
+        regression_iteration += 1
+        print(f"--- Starting Iteration {regression_iteration} ---")
+
+        remaining_pAct_correlations = correlation_matrix.loc[available_features, 'pAct']
+
+        if remaining_pAct_correlations.empty:
+            print("No more features available to consider for 'pAct' correlation.")
+            break
+
+        next_closest_feature_name = (remaining_pAct_correlations - 1.0).abs().idxmin()
+        next_closest_corr_value = remaining_pAct_correlations[next_closest_feature_name]
+
+        print(f"Step 1: Found next closest feature to 'pAct': '{next_closest_feature_name}' with correlation {next_closest_corr_value:.2f}")
+
+        valid_next_feature = True
+        for selected_feat in current_features:
+            correlation_with_selected = correlation_matrix.loc[next_closest_feature_name, selected_feat]
+            print(f"  Checking correlation with previously selected '{selected_feat}': {correlation_with_selected:.2f}")
+            if correlation_with_selected > 0.5:
+                print(f"    Correlation > 0.5, marking '{next_closest_feature_name}' as bad.")
+                valid_next_feature = False
+                break
+
+        if not valid_next_feature:
+            if next_closest_feature_name in available_features:
+                available_features.remove(next_closest_feature_name)
+            print(f"    Skipping '{next_closest_feature_name}', returning to Step 1.\n")
+            continue
+
+        print(f"Step 3: Adding '{next_closest_feature_name}' to the model.")
+        X_new = df_normalized[current_features + [next_closest_feature_name]]
+        new_coefficients, new_r_squared = perform_regression(X_new, Y)
+
+        if current_r_squared == 0:
+             improvement_percentage = ((new_r_squared - current_r_squared) / 0.01) * 100
+        else:
+            improvement_percentage = ((new_r_squared - current_r_squared) / abs(current_r_squared)) * 100
+
+        print(f"  New R-squared: {new_r_squared:.4f} (Old R-squared: {current_r_squared:.4f})")
+        print(f"  Improvement: {improvement_percentage:.2f}% (Threshold: 5.00%)")
+
+        if improvement_percentage <= 5.0:
+            print(f"  Improvement <= 5%, marking '{next_closest_feature_name}' as bad.")
+            if next_closest_feature_name in available_features:
+                available_features.remove(next_closest_feature_name)
+            print(f"  Skipping this model, returning to Step 1.\n")
+            continue
+        else:
+            print(f"  Improvement > 5%, accepting '{next_closest_feature_name}'.")
+            current_features.append(next_closest_feature_name)
+            current_r_squared = new_r_squared
+            final_coefficients = new_coefficients
+            final_r_squared = round(new_r_squared, 2)
+
+            rounded_intercept = round(new_coefficients[0], 2)
+            rounded_slopes = [round(slope, 2) for slope in new_coefficients[1:]]
+            rounded_r_squared = round(new_r_squared, 2)
+
+            print("\n--- New Linear Regression Results (Rounded to 2 decimals) ---")
+            print(f"Features used for X: {current_features}")
+            for i, feat_name in enumerate(current_features):
+                 print(f"  Slope for {feat_name}: {rounded_slopes[i]}")
+            print(f"  Intercept: {rounded_intercept}")
+            print(f"  R-squared: {rounded_r_squared}")
+            print("----------------------------------------------------------------\n")
+
+            if next_closest_feature_name in available_features:
+                available_features.remove(next_closest_feature_name)
+
+    print("--- Regression Loop Completed ---")
+    print(f"Final selected features: {current_features}")
+
+    final_rounded_intercept = round(final_coefficients[0], 2)
+    final_rounded_slopes = [round(slope, 2) for slope in final_coefficients[1:]]
+
+    equation_parts = [f"pAct = {final_rounded_intercept} +"]
+    for i, feat_name in enumerate(current_features):
+        slope_val = final_rounded_slopes[i]
+        if slope_val >= 0 and i > 0:
+            equation_parts.append(f"+ {feat_name} * ({slope_val})")
+        else:
+            equation_parts.append(f"{feat_name} * ({slope_val})")
+
+    final_equation_string = " ".join(equation_parts)
+    print(f"\n--- QSAR Formula ---")
+    print(final_equation_string)
+    print("-------------------------------------------------------")
+
+    # --- Plot 1: Scatter plot (Actual vs Predicted) ---
+    print("\n--- Creating scatter plot with original data and regression equation ---")
+
+    original_features = df_original.iloc[:, 1:]
+    original_X = original_features[current_features]
+    original_Y = df_original['pAct']
+
+    predicted_Y = np.full(len(original_X), final_rounded_intercept, dtype=float)
+    for i, feat_name in enumerate(current_features):
+        predicted_Y += original_X[feat_name].values * final_rounded_slopes[i]
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(original_Y, predicted_Y, alpha=0.7)
+    plt.plot([original_Y.min(), original_Y.max()], [original_Y.min(), original_Y.max()], 'r--', lw=2, label='Perfect Prediction')
+    plt.xlabel('Actual pAct')
+    plt.ylabel('Predicted pAct')
+    plt.title('Actual vs Predicted pAct Values\nUsing Final Regression Model')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.text(0.05, 0.95, f'R² = {final_r_squared}', transform=plt.gca().transAxes,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    plt.tight_layout()
+    plt.show()
+
+    # --- Plot 2: Hexagonal binning plot ---
+    print("\n--- Creating hexagonal binning plot (density view) ---")
+    plt.figure(figsize=(8, 6))
+    hb = plt.hexbin(original_Y, predicted_Y, gridsize=30, cmap='Blues', mincnt=1)
+    plt.plot([original_Y.min(), original_Y.max()], [original_Y.min(), original_Y.max()], 'r--', lw=2, label='Perfect Prediction')
+    plt.xlabel('Actual pAct')
+    plt.ylabel('Predicted pAct')
+    plt.title('Hexagonal Binning: Actual vs Predicted pAct\n(Density of Points)')
+    plt.colorbar(hb, label='Point Count per Hexagon')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Display styled correlation matrix heatmap ---
+    print("\n--- Displaying styled correlation matrix heatmap ---")
+    styled_correlation = (
+        correlation_matrix
+        .style
+        .background_gradient(cmap='coolwarm')
+        .format(precision=2)
+        .set_properties(**{'font-size': '14pt'})
+    )
+    try:
+        from IPython.display import display
+        display(styled_correlation)
+    except ImportError:
+        print("IPython.display not available. Skipping styled heatmap display.")
+
+
+if __name__ == "__main__":
+    main()
